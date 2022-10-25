@@ -22,7 +22,14 @@ package org.jasypt.properties;
 import java.io.IOException;
 import java.io.ObjectInputStream;
 import java.io.ObjectOutputStream;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.Enumeration;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Map.Entry;
 import java.util.Properties;
+import java.util.Set;
 
 import org.jasypt.commons.CommonUtils;
 import org.jasypt.encryption.StringEncryptor;
@@ -166,6 +173,7 @@ public final class EncryptableProperties extends Properties {
      * @param key the property key
      * @return the (decrypted) value
      */
+    @Override
     public String getProperty(final String key) {
         return decode(super.getProperty(key));
     }
@@ -185,6 +193,7 @@ public final class EncryptableProperties extends Properties {
      * @param defaultValue the default value to return
      * @return the (decrypted) value
      */
+    @Override
     public String getProperty(final String key, final String defaultValue) {
         return decode(super.getProperty(key, defaultValue));
     }
@@ -200,13 +209,36 @@ public final class EncryptableProperties extends Properties {
      * @return the (decrypted) value
      * @since 1.9.0
      */
+    @Override
     public synchronized Object get(final Object key) {
         final Object value = super.get(key);
-        final String valueStr = 
-                (value instanceof String) ? (String)value : null;
+        final String valueStr = (value instanceof String) ? (String)value : null;
         return decode(valueStr);
     }
-    
+
+    @Override
+    public Enumeration<Object> elements() {
+        return new DecodedElementEnumeration(super.elements());
+    }
+
+    @Override
+    public Set<Map.Entry<Object, Object>> entrySet() {
+        /*
+         * Because we don't know how often an entry in the set is read, it may be more efficient to decode
+         * all elements upfront. This is at risk of decoding entries that end up never being used, but with the
+         * benefit that entries are never decoded twice.
+         *
+         * Implementations were considered that lazily
+         */
+        final Set<Map.Entry<Object, Object>> encodedEntrySet = super.entrySet();
+        final LazilyDecodedReadOnlyEntrySet decodedEntrySet = new LazilyDecodedReadOnlyEntrySet(encodedEntrySet.size());
+        for (final Entry<Object, Object> entry : super.entrySet()) {
+            decodedEntrySet.addEncoded(entry.getKey(), entry.getValue());
+        }
+
+        // Similar behavior to Properties; ensure a synchronized set is returned.
+        return Collections.synchronizedSet(decodedEntrySet);
+    }
     
     /*
      *  Returns the identifier, just to be used by the registry
@@ -214,7 +246,6 @@ public final class EncryptableProperties extends Properties {
     Integer getIdent() {
         return this.ident;
     }
-    
 
     /*
      * Internal method for decoding (decrypting) a value if needed.
@@ -285,8 +316,94 @@ public final class EncryptableProperties extends Properties {
         outputStream.defaultWriteObject();
         
     }
-    
-    
+
+    /*
+    Using this class allows for lazy decryption of properties. Especially projects that have many encrypted properties
+    may suffer in performance if all properties are decrypted in one go. This solution allows for properties to only be
+    decrypted on an if-needed basis.
+     */
+    private final class DecodedElementEnumeration implements Enumeration<Object> {
+
+        private final Enumeration<Object> encodedEnumeration;
+
+        public DecodedElementEnumeration(final Enumeration<Object> encodedEnumeration) {
+            this.encodedEnumeration = encodedEnumeration;
+        }
+
+        @Override
+        public boolean hasMoreElements() {
+            return encodedEnumeration.hasMoreElements();
+        }
+
+        @Override
+        public Object nextElement() {
+            final Object encodedNextValue = encodedEnumeration.nextElement();
+            // Returning null if the value is not a String is consistent with the other methods in this class.
+            return encodedNextValue instanceof String ? decode((String) encodedNextValue) : null;
+        }
+
+    }
+
+    /*
+     * Because Properties.java does not support the add/addAll methods either, we mimic this behavior.
+     * All entries in this set are lazily decoded. If a value is accessed once and decoded, it will remain decoded
+     * for future references. This prevents duplicate decoding of a value.
+     */
+    private final class LazilyDecodedReadOnlyEntrySet extends HashSet<Map.Entry<Object, Object>> {
+
+        public LazilyDecodedReadOnlyEntrySet(final int capacity) {
+            super(capacity);
+        }
+
+        @Override
+        public boolean add(final Map.Entry<Object, Object> e) {
+            throw new UnsupportedOperationException();
+        }
+
+        @Override
+        public boolean addAll(final Collection<? extends Map.Entry<Object, Object>> c) {
+            throw new UnsupportedOperationException();
+        }
+
+        public void addEncoded(final Object key, final Object value) {
+            super.add(new LazyDecodingEntry(key, value));
+        }
+
+        private final class LazyDecodingEntry implements Map.Entry<Object, Object> {
+
+            private final Object key;
+            private Object value;
+            private boolean isDecoded = false;
+
+
+            public LazyDecodingEntry(final Object key, final Object encodedValue) {
+                this.key = key;
+                this.value = encodedValue;
+            }
+
+            @Override
+            public Object getKey() {
+                return key;
+            }
+
+            @Override
+            public synchronized Object getValue() {
+                if (!isDecoded) {
+                    value = value instanceof String ? decode((String) value) : null;
+                    isDecoded = true;
+                }
+                return value;
+            }
+
+            @Override
+            public synchronized Object setValue(final Object newValue) {
+                final Object oldValue = this.value;
+                this.value = newValue;
+                return oldValue;
+            }
+        }
+
+    }
 
     
 }
